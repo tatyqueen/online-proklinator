@@ -29,7 +29,7 @@ The storefront is GitHub Pages. `worker.js` runs as `proklinator-api` with the e
 | GET / | Version and liveness; never proof of a real payment |
 | GET /api/catalog | Public server prices |
 | POST /api/checkout | Authenticated intent; requires Idempotency-Key |
-| GET /api/orders | Owner's latest 50 purchases, without result bodies |
+| GET /api/orders | Owner's purchases, 20 per page; before cursor and nextCursor, without result bodies |
 | GET /api/orders/:orderId | Owner's status and paid result |
 | POST /telegram/webhook | Secret-authenticated Telegram updates |
 
