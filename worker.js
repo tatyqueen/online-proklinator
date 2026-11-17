@@ -1,5 +1,6 @@
 // Cloudflare Worker. BOT_TOKEN stays exclusively in the encrypted Worker binding.
-export const VERSION = 'stars-2026-11-17.1';
+export const VERSION = 'stars-2026-11-17.2';
+export const NOTICE_VERSION = '2026-11-17';
 export const ORIGIN = 'https://tatyqueen.github.io';
 export const WEBHOOK = 'https://proklinator-api.tanushaaim.workers.dev/telegram/webhook';
 export const APP = ORIGIN + '/online-proklinator/';
@@ -18,7 +19,9 @@ export const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS order_details (invoice_payload TEXT PRIMARY KEY REFERENCES payments(invoice_payload), telegram_user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_json TEXT NOT NULL, result_json TEXT NOT NULL, invoice_url TEXT, expires_at INTEGER NOT NULL, precheckout_id TEXT, UNIQUE(telegram_user_id,idempotency_key))`,
   `CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS payment_events (update_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, outcome TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)`,
-  `CREATE TABLE IF NOT EXISTS support_requests (update_id INTEGER PRIMARY KEY, telegram_user_id TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at TEXT DEFAULT CURRENT_TIMESTAMP)`
+  `CREATE TABLE IF NOT EXISTS support_requests (update_id INTEGER PRIMARY KEY, telegram_user_id TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at TEXT DEFAULT CURRENT_TIMESTAMP)`,
+  `CREATE TABLE IF NOT EXISTS order_consents (invoice_payload TEXT PRIMARY KEY REFERENCES payments(invoice_payload), telegram_user_id TEXT NOT NULL, rules_version TEXT NOT NULL, data_notice_version TEXT NOT NULL, entertainment_ack INTEGER NOT NULL CHECK(entertainment_ack=1), accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
+  `CREATE TABLE IF NOT EXISTS bot_outbox (event_key TEXT PRIMARY KEY, method TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)`
 ];
 const enc = new TextEncoder();
 const hex = bytes => Array.from(new Uint8Array(bytes), b=>b.toString(16).padStart(2,'0')).join('');
@@ -50,7 +53,7 @@ async function bot(env,method,data={}) {
   try {r=await fetch('https://api.telegram.org/bot'+env.BOT_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:AbortSignal.timeout(6500)}); j=await r.json();}
   catch{fail(502,'Telegram временно недоступен. Попробуйте позже.');}
   // Never propagate Telegram/network error bodies: they can contain sensitive information.
-  if(!r.ok||j.ok!==true)fail(502,'Telegram не подтвердил запрос. Попробуйте позже.');
+  if(!r.ok||j.ok!==true){const error=new HttpError(502,'Telegram не подтвердил запрос. Попробуйте позже.');error.telegramCode=Number(j.error_code)||r.status;throw error;}
   return j.result;
 }
 async function body(request) {
@@ -77,9 +80,10 @@ async function checkout(request,env,user){
   if(typeof b.target!=='string'||typeof b.reason!=='string')fail(400,'Заполните имя и причину.');
   const target=b.target.trim(),reason=b.reason.trim();
   if(!target||target.length>70||!reason||reason.length>280)fail(400,'Проверьте длину имени и причины.');
+  if(b.acceptance?.rulesVersion!==NOTICE_VERSION||b.acceptance?.dataNoticeVersion!==NOTICE_VERSION||b.acceptance?.entertainment!==true)fail(400,'Ознакомьтесь с правилами и информацией о данных и подтвердите игровой характер покупки.');
   const requestJson=JSON.stringify({serviceId:service.id,target,reason});
   const existing=await statement(env,`SELECT invoice_payload FROM order_details WHERE telegram_user_id=? AND idempotency_key=?`,user,key).first();
-  if(existing){const row=await order(env,existing.invoice_payload);if(row.request_json!==requestJson)fail(409,'Этот идентификатор уже относится к другому заказу.');return publicOrder(row);}
+  if(existing){const row=await order(env,existing.invoice_payload);if(row.request_json!==requestJson)fail(409,'Этот идентификатор уже относится к другому заказу.');if(row.status==='pending')await recordConsent(env,row.invoice_payload,user).run();return publicOrder(row);}
   const ready=await statement(env,"SELECT value FROM app_config WHERE key='checkout_enabled'").first();
   if(ready?.value!=='1')fail(503,'Касса ещё проходит настройку.');
   const webhookInfo=await bot(env,'getWebhookInfo');
@@ -89,7 +93,8 @@ async function checkout(request,env,user){
   try{
     await env.DB.batch([
       statement(env,`INSERT INTO payments(telegram_user_id,service_id,amount,invoice_payload) SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM payments WHERE telegram_user_id=? AND created_at>=datetime('now','-1 hour'))<10`,user,service.id,service.stars,payload,user),
-      statement(env,`INSERT INTO order_details(invoice_payload,telegram_user_id,idempotency_key,request_json,result_json,expires_at) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM payments WHERE invoice_payload=?)`,payload,user,key,requestJson,JSON.stringify(makeResult(service,target,reason,payload)),expires,payload)
+      statement(env,`INSERT INTO order_details(invoice_payload,telegram_user_id,idempotency_key,request_json,result_json,expires_at) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM payments WHERE invoice_payload=?)`,payload,user,key,requestJson,JSON.stringify(makeResult(service,target,reason,payload)),expires,payload),
+      recordConsent(env,payload,user)
     ]);
   }catch{
     const concurrent=await statement(env,`SELECT invoice_payload,request_json FROM order_details WHERE telegram_user_id=? AND idempotency_key=?`,user,key).first();
@@ -104,6 +109,22 @@ async function checkout(request,env,user){
     await statement(env,'UPDATE order_details SET invoice_url=? WHERE invoice_payload=?',link,payload).run();
   }catch(error){await statement(env,"UPDATE payments SET status='invoice_error' WHERE invoice_payload=? AND status='pending'",payload).run();throw error;}
   return publicOrder(await order(env,payload));
+}
+function recordConsent(env,payload,user){return statement(env,`INSERT OR IGNORE INTO order_consents(invoice_payload,telegram_user_id,rules_version,data_notice_version,entertainment_ack) SELECT ?,?,?,?,1 WHERE EXISTS(SELECT 1 FROM payments WHERE invoice_payload=? AND telegram_user_id=?)`,payload,user,NOTICE_VERSION,NOTICE_VERSION,payload,user);}
+function appButtons(){return {inline_keyboard:[[{text:'☠️ Выбрать пакость',web_app:{url:APP+'#services'}}],[{text:'🧾 Мои покупки',web_app:{url:APP+'#purchases'}}],[{text:'Правила и данные',url:APP+'notice.html'}]]};}
+async function sendOnce(env,key,method,payload){
+  await statement(env,`INSERT OR IGNORE INTO bot_outbox(event_key,method,payload_json) VALUES(?,?,?)`,key,method,JSON.stringify(payload)).run();
+  const now=Math.floor(Date.now()/1000);
+  const claimed=await statement(env,`UPDATE bot_outbox SET lease_until=?,attempts=attempts+1 WHERE event_key=? AND status='pending' AND lease_until<=? RETURNING *`,now+30,key,now).first();
+  if(!claimed){const row=await statement(env,'SELECT status FROM bot_outbox WHERE event_key=?',key).first();if(row?.status==='pending')fail(503,'Сообщение ожидает отправки.');return;}
+  try{await bot(env,claimed.method,JSON.parse(claimed.payload_json));await statement(env,"UPDATE bot_outbox SET status='sent',lease_until=0 WHERE event_key=?",key).run();}
+  catch(error){await statement(env,'UPDATE bot_outbox SET status=?,lease_until=0 WHERE event_key=?',error.telegramCode===403?'blocked':'pending',key).run();if(error.telegramCode!==403)throw error;}
+}
+async function purchaseMessage(env,user){
+  const rows=await statement(env,'SELECT invoice_payload,service_id,amount,status FROM payments WHERE telegram_user_id=? ORDER BY id DESC LIMIT 8',user).all();
+  if(!rows.results.length)return '🧾 В вашем архиве пока нет покупок. Выберите шуточный документ в каталоге — после оплаты он появится здесь.';
+  const labels={paid:'оплачено',pending:'ожидает оплаты',invoice_error:'счёт не создан',refunded:'возвращено'};
+  return '🧾 Ваши последние заказы\n\n'+rows.results.map(row=>(CATALOG.find(x=>x.id===row.service_id)?.name||row.service_id)+' · '+row.amount+' ⭐ · '+(labels[row.status]||row.status)+'\n'+row.invoice_payload).join('\n\n')+'\n\nВсе заказы и результаты — по кнопке «Мои покупки». Для текста в чате: /order номер_заказа.';
 }
 function validPayment(row,payment,user){return row&&payment.currency==='XTR'&&Number.isSafeInteger(payment.total_amount)&&payment.total_amount===row.amount&&String(user)===row.telegram_user_id;}
 async function webhook(request,env){
@@ -136,6 +157,8 @@ async function webhook(request,env){
       statement(env,`UPDATE payments SET status='paid',telegram_payment_charge_id=?,paid_at=CURRENT_TIMESTAMP WHERE invoice_payload=? AND status='pending' AND telegram_payment_charge_id IS NULL AND NOT EXISTS(SELECT 1 FROM payments WHERE telegram_payment_charge_id=?)`,charge,row.invoice_payload,charge),
       statement(env,`INSERT OR IGNORE INTO payment_events(update_id,kind,outcome) VALUES(?,'successful_payment',CASE WHEN EXISTS(SELECT 1 FROM payments WHERE invoice_payload=? AND telegram_payment_charge_id=? AND status IN ('paid','refunded')) THEN 'recorded' ELSE 'conflict' END)`,update.update_id,row.invoice_payload,charge)
     ]);
+    const recorded=await order(env,row.invoice_payload);
+    if(recorded.status==='paid'&&recorded.telegram_payment_charge_id===charge)await sendOnce(env,'paid:'+row.invoice_payload,'sendMessage',{chat_id:Number(row.telegram_user_id),text:'🧾 Оплата подтверждена: '+(CATALOG.find(s=>s.id===row.service_id)?.name||row.service_id)+' · '+row.amount+' ⭐\n\nТатьяна изучила дело, Екатерина поставила печать. Ваш шуточный документ готов. Открывайте его в «Моих покупках» — повторно платить не нужно.\n\nЗаказ: '+row.invoice_payload+'\nПомощь: /paysupport номер заказа и описание.',reply_markup:{inline_keyboard:[[{text:'Открыть купленный результат',web_app:{url:APP+'#order='+row.invoice_payload}}],[{text:'Все мои покупки',web_app:{url:APP+'#purchases'}}]]}});
     return {ok:true};
   }
   const refund=message?.refunded_payment;
@@ -146,12 +169,28 @@ async function webhook(request,env){
     ]);return {ok:true};
   }
   if(message?.chat?.type==='private'&&typeof message.text==='string'){
-    const command=message.text.split(/[\s@]/)[0];
+    const command=message.text.split(/[\s@]/)[0],user=String(message.from.id),eventKey='command:'+update.update_id;
+    if(String(message.chat.id)!==user)return {ok:true};
     if(command==='/paysupport'){
       await statement(env,`INSERT OR IGNORE INTO support_requests(update_id,telegram_user_id,message) VALUES(?,?,?)`,update.update_id,String(message.from.id),message.text.slice(0,2000)).run();
-      await bot(env,'sendMessage',{chat_id:message.chat.id,text:'Обращение № '+update.update_id+' сохранено. Для деталей отправьте /paysupport номер заказа и описание проблемы. Не присылайте пароли и платёжные реквизиты. Покупки можно восстановить кнопкой «Мои покупки» в приложении.'});
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'🐈 Кот-аудитор зарегистрировал обращение № '+update.update_id+'.\n\nВладелец сервиса увидит его в очереди поддержки. Если ещё не описали проблему, отправьте /paysupport номер заказа и подробности. Не присылайте пароли, документы и реквизиты карты.\n\nПокупки можно восстановить по кнопке ниже.',reply_markup:appButtons()});
+    }else if(command==='/purchases'||command==='/orders'){
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:await purchaseMessage(env,user),reply_markup:appButtons()});
+    }else if(command==='/order'){
+      const payload=message.text.trim().split(/\s+/)[1]||'';const row=/^p_[a-f0-9-]{36}$/.test(payload)?await order(env,payload):null;
+      const text=row&&row.telegram_user_id===user&&row.status==='paid'?JSON.parse(row.result_json).text+'\n\nИсключительно шуточная магия. Заказ: '+row.invoice_payload:'Оплаченный заказ для этого аккаунта не найден. Проверьте номер в «Моих покупках».';
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text,reply_markup:appButtons()});
+    }else if(command==='/privacy'||command==='/terms'){
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'📜 Правила и информация о данных: '+APP+'notice.html\n\nДля заказа сохраняем Telegram ID, введённый текст, результат и сведения о платеже. Для запроса доступа, исправления или удаления данных: /paysupport ваш запрос. Окончательные документы продавца для Казахстана ещё готовятся.',reply_markup:appButtons()});
     }else if(command==='/start'||command==='/help'){
-      await bot(env,'sendMessage',{chat_id:message.chat.id,text:'Тайная канцелярия на связи! Здесь только шуточные цифровые документы. Оплата — Telegram Stars. Помощь с покупкой: /paysupport номер заказа и описание.',reply_markup:{inline_keyboard:[[{text:'Открыть канцелярию',web_app:{url:APP}}]]}});
+      const text='🔮 Добро пожаловать в «Проклинатор душ»!\n\nТатьяна разбирается, что случилось. Екатерина оформляет последствия. Кот-аудитор проверяет печати.\n\nВыберите пакость → придумайте прозвище и ситуацию → получите персональный шуточный документ. Только вымысел и юмор, никакого реального воздействия.\n\n⭐ Оплата — Telegram Stars, без подписки.\n🧾 /purchases — ваши покупки по Telegram ID.\n💬 /paysupport — помощь с заказом.\n📜 /terms и /privacy — правила и данные.';
+      if(command==='/start')await sendOnce(env,eventKey,'sendPhoto',{chat_id:message.chat.id,photo:APP+'assets/bot-cover.jpg',caption:text,reply_markup:appButtons()});
+      else await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text,reply_markup:appButtons()});
+    }else if(!message.text.startsWith('/')){
+      await statement(env,`INSERT OR IGNORE INTO support_requests(update_id,telegram_user_id,message) VALUES(?,?,?)`,update.update_id,user,message.text.slice(0,2000)).run();
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'💬 Сообщение передано в очередь поддержки. Номер обращения: '+update.update_id+'.\nКаталог и ваши документы доступны по кнопкам ниже.',reply_markup:appButtons()});
+    }else{
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'Кот не нашёл такую команду. /help — помощь, /purchases — покупки, /paysupport — поддержка.',reply_markup:appButtons()});
     }
   }
   return {ok:true};
@@ -171,17 +210,19 @@ export default {
       if(origin&&origin!==ORIGIN)fail(403,'Источник не разрешён.');
       if(request.method==='OPTIONS')return new Response(null,{status:204,headers});
       if(url.pathname==='/'&&request.method==='GET')return respond({project:'Проклинатор душ',status:'online',version:VERSION,payments:'verification_required'});
-      if(url.pathname==='/api/catalog'&&request.method==='GET')return respond({currency:'XTR',services:CATALOG});
+      if(url.pathname==='/api/catalog'&&request.method==='GET')return respond({currency:'XTR',services:CATALOG,noticeVersion:NOTICE_VERSION});
       if(!env.BOT_TOKEN||!env.DB)fail(503,'Касса ещё не настроена.');
-      if(!['/api/checkout','/api/orders'].includes(url.pathname)&&!/^\/api\/orders\/p_[a-f0-9-]{36}$/.test(url.pathname))fail(404,'Маршрут не найден.');
+      if(!['/api/checkout','/api/orders','/api/account'].includes(url.pathname)&&!/^\/api\/orders\/p_[a-f0-9-]{36}$/.test(url.pathname))fail(404,'Маршрут не найден.');
       if((url.pathname==='/api/checkout'&&request.method!=='POST')||(url.pathname!=='/api/checkout'&&request.method!=='GET'))fail(405,'Метод не разрешён.');
       const auth=request.headers.get('Authorization')||'';
       if(!auth.startsWith('tma '))fail(401,'Откройте приложение через Telegram.');
       const user=await validateInitData(auth.slice(4),env.BOT_TOKEN);
       if(url.pathname==='/api/checkout')return respond(await checkout(request,env,user));
+      if(url.pathname==='/api/account')return respond({telegramUserId:user,...await statement(env,"SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END),0) paid,COALESCE(SUM(CASE WHEN status='paid' THEN amount ELSE 0 END),0) stars FROM payments WHERE telegram_user_id=?",user).first()});
       if(url.pathname==='/api/orders'){
-        const rows=await statement(env,`SELECT p.*,d.result_json,d.invoice_url,d.expires_at FROM payments p JOIN order_details d USING(invoice_payload) WHERE p.telegram_user_id=? ORDER BY p.id DESC LIMIT 50`,user).all();
-        return respond({orders:rows.results.map(row=>publicOrder(row,false))});
+        const before=Number(url.searchParams.get('before')||Number.MAX_SAFE_INTEGER);if(!Number.isSafeInteger(before)||before<1)fail(400,'Неверная страница.');
+        const rows=await statement(env,`SELECT p.*,d.result_json,d.invoice_url,d.expires_at FROM payments p JOIN order_details d USING(invoice_payload) WHERE p.telegram_user_id=? AND p.id<? ORDER BY p.id DESC LIMIT 21`,user,before).all();
+        const page=rows.results.slice(0,20);return respond({orders:page.map(row=>publicOrder(row,false)),nextCursor:rows.results.length>20?page.at(-1).id:null});
       }
       const row=await order(env,url.pathname.split('/').pop());
       if(!row||row.telegram_user_id!==user)fail(404,'Заказ не найден.');

@@ -1,5 +1,13 @@
 # Telegram Stars checkout
 
+## Update: personal archive and bot (2026-11-17.2)
+
+The lower navigation now has «Покупки». Its authenticated `/api/account` summary and cursor-paginated `/api/orders` history are always scoped to the validated Telegram ID. Paid documents open in the archive; a deep link contains only an order ID and never bypasses authentication.
+
+New checkout requests require three active acknowledgements: service rules, data notice, and entertainment-only nature. The server validates the current notice versions and records them with the owner, order and timestamp in `order_consents`. These are acknowledgements of `notice.html`, **not a claim of complete legal compliance or a finalized offer/privacy policy**. Existing invoices from the previous release are not falsely recorded as accepted retroactively.
+
+Apply `migrations/0002_purchases_bot.sql` before deploying this release. Receipt and command messages use `bot_outbox`; see `BOT.md` for delivery limitations and support operations. Tests now cover 26 cases, including acknowledgements, bot ownership checks, receipt retries and pagination.
+
 The storefront is GitHub Pages. `worker.js` runs as `proklinator-api` with the existing encrypted `BOT_TOKEN` secret and D1 `DB` binding. Never place BOT_TOKEN in GitHub, browser code, URLs opened in a browser, logs, or chat.
 
 ## Trust boundaries
