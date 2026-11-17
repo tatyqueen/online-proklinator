@@ -1,0 +1,11 @@
+{
+  "name": "proklinator-api",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-17",
+  "workers_dev": true,
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "proklinator-db",
+    "database_id": "b8493246-967e-4523-a9c8-93d679ab9d39"
+  }]
+}
