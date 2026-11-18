@@ -1,5 +1,5 @@
 // Cloudflare Worker. BOT_TOKEN stays exclusively in the encrypted Worker binding.
-export const VERSION = 'stars-2026-11-17.2';
+export const VERSION = 'stars-2026-11-18.1';
 export const NOTICE_VERSION = '2026-11-17';
 export const ORIGIN = 'https://tatyqueen.github.io';
 export const WEBHOOK = 'https://proklinator-api.tanushaaim.workers.dev/telegram/webhook';
@@ -112,6 +112,9 @@ async function checkout(request,env,user){
 }
 function recordConsent(env,payload,user){return statement(env,`INSERT OR IGNORE INTO order_consents(invoice_payload,telegram_user_id,rules_version,data_notice_version,entertainment_ack) SELECT ?,?,?,?,1 WHERE EXISTS(SELECT 1 FROM payments WHERE invoice_payload=? AND telegram_user_id=?)`,payload,user,NOTICE_VERSION,NOTICE_VERSION,payload,user);}
 function appButtons(){return {inline_keyboard:[[{text:'☠️ Выбрать пакость',web_app:{url:APP+'#services'}}],[{text:'🧾 Мои покупки',web_app:{url:APP+'#purchases'}}],[{text:'Правила и данные',url:APP+'notice.html'}]]};}
+// Keep Mini App launches in inline buttons: keyboard web_app launches do not
+// supply the same signed initData needed by checkout and private purchases.
+function chatMenu(){return {keyboard:[[{text:'🔮 Открыть канцелярию'}],[{text:'🧾 Мои покупки'},{text:'💬 Поддержка'}],[{text:'❓ Помощь'}]],resize_keyboard:true,is_persistent:true,one_time_keyboard:false,input_field_placeholder:'Выберите пункт меню или напишите вопрос'};}
 async function sendOnce(env,key,method,payload){
   await statement(env,`INSERT OR IGNORE INTO bot_outbox(event_key,method,payload_json) VALUES(?,?,?)`,key,method,JSON.stringify(payload)).run();
   const now=Math.floor(Date.now()/1000);
@@ -169,9 +172,14 @@ async function webhook(request,env){
     ]);return {ok:true};
   }
   if(message?.chat?.type==='private'&&typeof message.text==='string'){
-    const command=message.text.split(/[\s@]/)[0],user=String(message.from.id),eventKey='command:'+update.update_id;
+    const menuCommands={'🔮 Открыть канцелярию':'/catalog','🧾 Мои покупки':'/purchases','💬 Поддержка':'/support','❓ Помощь':'/help'};
+    const command=menuCommands[message.text.trim()]||message.text.split(/[\s@]/)[0],user=String(message.from.id),eventKey='command:'+update.update_id;
     if(String(message.chat.id)!==user)return {ok:true};
-    if(command==='/paysupport'){
+    if(command==='/catalog'){
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'🔮 Канцелярия открыта! Выберите пакость или загляните в свои покупки по кнопкам ниже.',reply_markup:appButtons()});
+    }else if(command==='/support'){
+      await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'💬 Поддержка канцелярии\n\nНапишите следующим сообщением, что случилось. Если вопрос о покупке, добавьте номер заказа из «Моих покупок». Обращение сохранится в очереди владельца сервиса. Это не мгновенный чат с оператором.\n\nДля вопроса об оплате или возврате также можно использовать /paysupport номер заказа и описание. Не присылайте пароли, документы и реквизиты карты.',reply_markup:appButtons()});
+    }else if(command==='/paysupport'){
       await statement(env,`INSERT OR IGNORE INTO support_requests(update_id,telegram_user_id,message) VALUES(?,?,?)`,update.update_id,String(message.from.id),message.text.slice(0,2000)).run();
       await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'🐈 Кот-аудитор зарегистрировал обращение № '+update.update_id+'.\n\nВладелец сервиса увидит его в очереди поддержки. Если ещё не описали проблему, отправьте /paysupport номер заказа и подробности. Не присылайте пароли, документы и реквизиты карты.\n\nПокупки можно восстановить по кнопке ниже.',reply_markup:appButtons()});
     }else if(command==='/purchases'||command==='/orders'){
@@ -182,10 +190,11 @@ async function webhook(request,env){
       await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text,reply_markup:appButtons()});
     }else if(command==='/privacy'||command==='/terms'){
       await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'📜 Правила и информация о данных: '+APP+'notice.html\n\nДля заказа сохраняем Telegram ID, введённый текст, результат и сведения о платеже. Для запроса доступа, исправления или удаления данных: /paysupport ваш запрос. Окончательные документы продавца для Казахстана ещё готовятся.',reply_markup:appButtons()});
-    }else if(command==='/start'||command==='/help'){
+    }else if(command==='/start'||command==='/help'||command==='/menu'){
       const text='🔮 Добро пожаловать в «Проклинатор душ»!\n\nТатьяна разбирается, что случилось. Екатерина оформляет последствия. Кот-аудитор проверяет печати.\n\nВыберите пакость → придумайте прозвище и ситуацию → получите персональный шуточный документ. Только вымысел и юмор, никакого реального воздействия.\n\n⭐ Оплата — Telegram Stars, без подписки.\n🧾 /purchases — ваши покупки по Telegram ID.\n💬 /paysupport — помощь с заказом.\n📜 /terms и /privacy — правила и данные.';
-      if(command==='/start')await sendOnce(env,eventKey,'sendPhoto',{chat_id:message.chat.id,photo:APP+'assets/bot-cover.jpg',caption:text,reply_markup:appButtons()});
-      else await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text,reply_markup:appButtons()});
+      const menuHint='\n\n👇 Кнопки меню — под строкой ввода. Если скрылись, нажмите значок клавиатуры или отправьте /menu.';
+      if(command==='/start')await sendOnce(env,eventKey,'sendPhoto',{chat_id:message.chat.id,photo:APP+'assets/bot-cover.jpg',caption:text+menuHint,reply_markup:chatMenu()});
+      else await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:text+menuHint,reply_markup:chatMenu()});
     }else if(!message.text.startsWith('/')){
       await statement(env,`INSERT OR IGNORE INTO support_requests(update_id,telegram_user_id,message) VALUES(?,?,?)`,update.update_id,user,message.text.slice(0,2000)).run();
       await sendOnce(env,eventKey,'sendMessage',{chat_id:message.chat.id,text:'💬 Сообщение передано в очередь поддержки. Номер обращения: '+update.update_id+'.\nКаталог и ваши документы доступны по кнопкам ниже.',reply_markup:appButtons()});
