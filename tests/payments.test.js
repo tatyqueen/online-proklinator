@@ -7,11 +7,14 @@ import vm from 'node:vm';
 import worker,{SCHEMA,WEBHOOK,ORIGIN,validateInitData,webhookSecret,NOTICE_VERSION} from '../worker.js';
 
 const TOKEN='123456:test-token-only-not-real';
+const TEST_PNG='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=';
 function signed(user=123,age=0,extra={}){
   const p=new URLSearchParams({auth_date:String(Math.floor(Date.now()/1000)-age),user:JSON.stringify({id:user,first_name:'Test'}),...extra});p.sort();
   const key=createHmac('sha256','WebAppData').update(TOKEN).digest();
   p.set('hash',createHmac('sha256',key).update([...p].map(([k,v])=>k+'='+v).join('\n')).digest('hex'));return p.toString();
 }
+test('certificate delivery requires signed identity, sends only to that identity and deduplicates',async()=>{const f=fixture(),body=JSON.stringify({png:TEST_PNG,chat_id:999});assert.equal((await f.api('/api/certificate',{method:'POST',auth:'forged',body})).status,401);assert.equal((await f.api('/api/certificate',{method:'POST',body})).status,200);assert.equal((await f.api('/api/certificate',{method:'POST',body})).status,200);const calls=f.calls.filter(x=>x.method==='sendDocument');assert.equal(calls.length,1);assert.equal(calls[0].data.chat_id,'123');assert.equal(calls[0].data.document.type,'image/png');assert.equal(calls[0].data.document.name,'proklinator-certificate.png');assert.equal(f.db.prepare('SELECT payload_json FROM bot_outbox').get().payload_json,'{}');assert.equal(f.db.prepare('SELECT COUNT(*) n FROM payments').get().n,0);});
+test('certificate rejects malformed, oversized and rate-limited uploads; failures are retryable',async()=>{const f=fixture();for(const png of ['bad','a'.repeat(1500000),btoa('not an image')])assert.ok([400,413].includes((await f.api('/api/certificate',{method:'POST',body:JSON.stringify({png})})).status));assert.equal(f.calls.length,0);f.setMessageError(true);const body=JSON.stringify({png:TEST_PNG});const failed=await f.api('/api/certificate',{method:'POST',body});assert.equal(failed.status,502);assert.ok(!JSON.stringify(failed).includes(TOKEN));f.setMessageError(false);assert.equal((await f.api('/api/certificate',{method:'POST',body})).status,200);for(let i=0;i<10;i++)f.db.prepare("INSERT INTO bot_outbox(event_key,method,payload_json) VALUES(?,'sendDocument','{}')").run('export:999:test-'+i);assert.equal((await f.api('/api/certificate',{user:999,method:'POST',body})).status,429);});
 function database(){
   const db=new DatabaseSync(':memory:');db.exec('PRAGMA foreign_keys=ON');SCHEMA.forEach(sql=>db.exec(sql));db.exec("INSERT INTO app_config VALUES('checkout_enabled','1')");
   const adapter={prepare(sql){return {bind(...args){return {async first(){return db.prepare(sql).get(...args)||null;},async all(){return {results:db.prepare(sql).all(...args)};},async run(){const r=db.prepare(sql).run(...args);return {meta:{changes:Number(r.changes)}};}};}};},async batch(items){db.exec('BEGIN');try{const values=[];for(const item of items)values.push(await item.run());db.exec('COMMIT');return values;}catch(e){db.exec('ROLLBACK');throw e;}}};return {db,adapter};
@@ -19,8 +22,8 @@ function database(){
 function fixture(){
   const {db,adapter}=database(),calls=[];const env={DB:adapter,BOT_TOKEN:TOKEN};
   let invoiceError=false,messageError=false;
-  globalThis.fetch=async(url,opts)=>{const method=url.split('/').pop(),data=JSON.parse(opts.body);calls.push({method,data});
-    if((method==='sendMessage'||method==='sendPhoto')&&messageError)return Response.json({ok:false,error_code:500},{status:500});
+  globalThis.fetch=async(url,opts)=>{const method=url.split('/').pop(),data=opts.body instanceof FormData?Object.fromEntries(opts.body):JSON.parse(opts.body);calls.push({method,data});
+    if((method==='sendMessage'||method==='sendPhoto'||method==='sendDocument')&&messageError)return Response.json({ok:false,error_code:500},{status:500});
     if(method==='createInvoiceLink'&&invoiceError)return Response.json({ok:false,description:'token-must-not-leak'},{status:500});
     const result=method==='getWebhookInfo'?{url:WEBHOOK}:method==='createInvoiceLink'?'https://t.me/$test_'+calls.length:true;
     return Response.json({ok:true,result});};

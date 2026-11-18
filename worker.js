@@ -1,5 +1,5 @@
 // Cloudflare Worker. BOT_TOKEN stays exclusively in the encrypted Worker binding.
-export const VERSION = 'stars-2026-11-18.1';
+export const VERSION = 'stars-2026-11-18.2';
 export const NOTICE_VERSION = '2026-11-17';
 export const ORIGIN = 'https://tatyqueen.github.io';
 export const WEBHOOK = 'https://proklinator-api.tanushaaim.workers.dev/telegram/webhook';
@@ -56,16 +56,38 @@ async function bot(env,method,data={}) {
   if(!r.ok||j.ok!==true){const error=new HttpError(502,'Telegram не подтвердил запрос. Попробуйте позже.');error.telegramCode=Number(j.error_code)||r.status;throw error;}
   return j.result;
 }
-async function body(request) {
+async function body(request,limit=32768) {
   if(!request.headers.get('Content-Type')?.toLowerCase().startsWith('application/json'))fail(415,'Ожидается JSON.');
   const reader=request.body?.getReader(); if(!reader)fail(400,'Пустой запрос.');
   let size=0,parts=[];
-  try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>32768){await reader.cancel();fail(413,'Слишком большой запрос.');}parts.push(value);}}
+  try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit){await reader.cancel();fail(413,'Слишком большой запрос.');}parts.push(value);}}
   finally{reader.releaseLock();}
   const bytes=new Uint8Array(size);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}
   try{return JSON.parse(new TextDecoder().decode(bytes));}catch{fail(400,'Некорректный JSON.');}
 }
 function statement(env,sql,...args){return env.DB.prepare(sql).bind(...args);}
+async function sendCertificate(request,env,user){
+  const b=await body(request,1450000);
+  if(typeof b.png!=='string'||b.png.length>1400000||!b.png.length||b.png.length%4||!/^[A-Za-z0-9+/]+={0,2}$/.test(b.png))fail(400,'Ожидается PNG-сертификат.');
+  let bytes;try{bytes=Uint8Array.from(atob(b.png),c=>c.charCodeAt(0));}catch{fail(400,'Некорректная картинка.');}
+  const header=[137,80,78,71,13,10,26,10];
+  if(bytes.length<45||bytes.length>1048576||header.some((v,i)=>bytes[i]!==v)||new DataView(bytes.buffer).getUint32(8)!==13||String.fromCharCode(...bytes.slice(12,16))!=='IHDR')fail(400,'Ожидается PNG размером до 1 МБ.');
+  const view=new DataView(bytes.buffer),width=view.getUint32(16),height=view.getUint32(20);
+  if(!width||!height||width>4096||height>8192)fail(400,'Неверный размер изображения.');
+  const digest=hex(await crypto.subtle.digest('SHA-256',bytes)),prefix='export:'+user+':',key=prefix+Math.floor(Date.now()/300000)+':'+digest;
+  await statement(env,`INSERT OR IGNORE INTO bot_outbox(event_key,method,payload_json) SELECT ?,'sendDocument','{}' WHERE (SELECT COUNT(*) FROM bot_outbox WHERE event_key LIKE ? AND created_at>datetime('now','-1 hour'))<10`,key,prefix+'%').run();
+  const row=await statement(env,'SELECT status FROM bot_outbox WHERE event_key=?',key).first();
+  if(!row)fail(429,'Можно отправить до 10 сертификатов в час. Попробуйте позже.');
+  if(row.status==='sent')return {sent:true};
+  const now=Math.floor(Date.now()/1000),lease=await statement(env,"UPDATE bot_outbox SET lease_until=?,attempts=attempts+1 WHERE event_key=? AND status='pending' AND lease_until<=?",now+30,key,now).run();
+  if(lease.meta.changes!==1)fail(409,'Файл уже отправляется. Проверьте чат с ботом.');
+  try{
+    const form=new FormData();form.set('chat_id',user);form.set('document',new Blob([bytes],{type:'image/png'}),'proklinator-certificate.png');form.set('caption','📜 Ваш шуточный сертификат. Откройте файл и сохраните его на устройство.');
+    let r,j;try{r=await fetch('https://api.telegram.org/bot'+env.BOT_TOKEN+'/sendDocument',{method:'POST',body:form,signal:AbortSignal.timeout(8000)});j=await r.json();}catch{fail(502,'Не удалось подтвердить доставку. Проверьте чат с ботом перед повторной отправкой.');}
+    if(!r.ok||j.ok!==true)fail(502,j.error_code===403?'Откройте бота, нажмите «Старт» и разрешите сообщения. Затем повторите отправку.':'Telegram не принял файл. Попробуйте другой способ сохранения.');
+    await statement(env,"UPDATE bot_outbox SET status='sent',lease_until=0 WHERE event_key=?",key).run();return {sent:true};
+  }catch(error){await statement(env,'UPDATE bot_outbox SET lease_until=0 WHERE event_key=?',key).run();throw error;}
+}
 async function order(env,payload){return statement(env,`SELECT p.*,d.request_json,d.result_json,d.invoice_url,d.expires_at,d.precheckout_id FROM payments p JOIN order_details d USING(invoice_payload) WHERE p.invoice_payload=?`,payload).first();}
 function publicOrder(row, includeResult=true){return {orderId:row.invoice_payload,serviceId:row.service_id,amount:row.amount,currency:'XTR',status:row.status==='pending'&&row.expires_at<=Math.floor(Date.now()/1000)?'expired':row.status,createdAt:row.created_at,paidAt:row.paid_at,...(row.status==='pending'&&row.expires_at>Math.floor(Date.now()/1000)&&row.invoice_url?{invoiceUrl:row.invoice_url}:{}),...(includeResult&&row.status==='paid'?{result:JSON.parse(row.result_json)}:{})};}
 function makeResult(service,target,reason,payload){
@@ -221,11 +243,12 @@ export default {
       if(url.pathname==='/'&&request.method==='GET')return respond({project:'Проклинатор душ',status:'online',version:VERSION,payments:'verification_required'});
       if(url.pathname==='/api/catalog'&&request.method==='GET')return respond({currency:'XTR',services:CATALOG,noticeVersion:NOTICE_VERSION});
       if(!env.BOT_TOKEN||!env.DB)fail(503,'Касса ещё не настроена.');
-      if(!['/api/checkout','/api/orders','/api/account'].includes(url.pathname)&&!/^\/api\/orders\/p_[a-f0-9-]{36}$/.test(url.pathname))fail(404,'Маршрут не найден.');
-      if((url.pathname==='/api/checkout'&&request.method!=='POST')||(url.pathname!=='/api/checkout'&&request.method!=='GET'))fail(405,'Метод не разрешён.');
+      if(!['/api/checkout','/api/orders','/api/account','/api/certificate'].includes(url.pathname)&&!/^\/api\/orders\/p_[a-f0-9-]{36}$/.test(url.pathname))fail(404,'Маршрут не найден.');
+      if(request.method!==(['/api/checkout','/api/certificate'].includes(url.pathname)?'POST':'GET'))fail(405,'Метод не разрешён.');
       const auth=request.headers.get('Authorization')||'';
       if(!auth.startsWith('tma '))fail(401,'Откройте приложение через Telegram.');
       const user=await validateInitData(auth.slice(4),env.BOT_TOKEN);
+      if(url.pathname==='/api/certificate')return respond(await sendCertificate(request,env,user));
       if(url.pathname==='/api/checkout')return respond(await checkout(request,env,user));
       if(url.pathname==='/api/account')return respond({telegramUserId:user,...await statement(env,"SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END),0) paid,COALESCE(SUM(CASE WHEN status='paid' THEN amount ELSE 0 END),0) stars FROM payments WHERE telegram_user_id=?",user).first()});
       if(url.pathname==='/api/orders'){
