@@ -1,5 +1,5 @@
 // Cloudflare Worker. BOT_TOKEN stays exclusively in the encrypted Worker binding.
-export const VERSION = 'stars-2026-11-18.2';
+export const VERSION = 'stars-2026-11-18.3';
 export const NOTICE_VERSION = '2026-11-17';
 export const ORIGIN = 'https://tatyqueen.github.io';
 export const WEBHOOK = 'https://proklinator-api.tanushaaim.workers.dev/telegram/webhook';
@@ -67,11 +67,11 @@ async function body(request,limit=32768) {
 }
 function statement(env,sql,...args){return env.DB.prepare(sql).bind(...args);}
 async function sendCertificate(request,env,user){
-  const b=await body(request,1450000);
-  if(typeof b.png!=='string'||b.png.length>1400000||!b.png.length||b.png.length%4||!/^[A-Za-z0-9+/]+={0,2}$/.test(b.png))fail(400,'Ожидается PNG-сертификат.');
+  const b=await body(request,7010000);
+  if(typeof b.png!=='string'||b.png.length>7000000||!b.png.length||b.png.length%4||!/^[A-Za-z0-9+/]+={0,2}$/.test(b.png))fail(400,'Ожидается PNG-сертификат.');
   let bytes;try{bytes=Uint8Array.from(atob(b.png),c=>c.charCodeAt(0));}catch{fail(400,'Некорректная картинка.');}
   const header=[137,80,78,71,13,10,26,10];
-  if(bytes.length<45||bytes.length>1048576||header.some((v,i)=>bytes[i]!==v)||new DataView(bytes.buffer).getUint32(8)!==13||String.fromCharCode(...bytes.slice(12,16))!=='IHDR')fail(400,'Ожидается PNG размером до 1 МБ.');
+  if(bytes.length<45||bytes.length>5242880||header.some((v,i)=>bytes[i]!==v)||new DataView(bytes.buffer).getUint32(8)!==13||String.fromCharCode(...bytes.slice(12,16))!=='IHDR')fail(400,'Ожидается PNG размером до 5 МБ.');
   const view=new DataView(bytes.buffer),width=view.getUint32(16),height=view.getUint32(20);
   if(!width||!height||width>4096||height>8192)fail(400,'Неверный размер изображения.');
   const digest=hex(await crypto.subtle.digest('SHA-256',bytes)),prefix='export:'+user+':',key=prefix+Math.floor(Date.now()/300000)+':'+digest;
